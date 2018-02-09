@@ -5,23 +5,25 @@ import calendar
 import logging
 import gc
 
+from datetime import datetime
+from s2sphere import LatLng
+from bisect import bisect_left
 from flask import Flask, abort, jsonify, render_template, request, \
     make_response, send_from_directory, send_file
 from flask.json import JSONEncoder
 from flask_compress import Compress
-from datetime import datetime
-from s2sphere import LatLng
 from pogom.dyn_img import get_gym_icon, get_pokemon_map_icon, get_pokemon_raw_icon
 from pogom.pgscout import scout_error, pgscout_encounter
-from pogom.utils import get_args, get_pokemon_name
-from bisect import bisect_left
+
 
 from pogom.weather import get_weather_cells, get_s2_coverage, get_weather_alerts
 from .models import (Pokemon, Gym, Pokestop, ScannedLocation,
                      MainWorker, WorkerStatus, Token, HashKeys,
                      SpawnPoint)
-from .utils import (get_pokemon_name, get_pokemon_types, get_pokemon_rarity,
+from .utils import (get_args, get_pokemon_name, get_pokemon_types,
                     now, dottedQuadToNum)
+from .client_auth import (redirect_client_to_auth, valid_client_auth, valid_discord_guild,
+                          redirect_to_discord_guild_invite, valid_discord_guild_role)
 from .transform import transform_from_wgs_to_gcj
 from .blacklist import fingerprints, get_ip_blacklist
 
@@ -38,7 +40,6 @@ def convert_pokemon_list(pokemon):
     pokemon_result = []
     for p in pokemon:
         p['pokemon_name'] = get_pokemon_name(p['pokemon_id'])
-        p['pokemon_rarity'] = get_pokemon_rarity(p['pokemon_id'])
         p['pokemon_types'] = get_pokemon_types(p['pokemon_id'])
         p['encounter_id'] = str(p['encounter_id'])
         if args.china:
@@ -73,9 +74,12 @@ class Pogom(Flask):
             self.blacklist = []
             self.blacklist_keys = []
 
+        self.user_auth_code_cache = {}
+
         # Routes
         self.json_encoder = CustomJSONEncoder
         self.route("/", methods=['GET'])(self.fullmap)
+        self.route("/auth_callback", methods=['GET'])(self.auth_callback)
         self.route("/raw_data", methods=['GET'])(self.raw_data)
         self.route("/loc", methods=['GET'])(self.loc)
         self.route("/next_loc", methods=['POST'])(self.next_loc)
@@ -278,14 +282,17 @@ class Pogom(Flask):
             return jsonify({'message': 'invalid use of api'})
         return self.get_search_control()
 
+    def auth_callback(self, statusname=None):
+        return render_template('auth_callback.html')
+
+
     def fullmap(self, statusname=None):
         self.heartbeat[0] = now()
         args = get_args()
         if args.on_demand_timeout > 0:
             self.control_flags['on_demand'].clear()
 
-        search_display = True if (args.search_control and
-                                  args.on_demand_timeout <= 0) else False
+        search_display = (args.search_control and args.on_demand_timeout <= 0)
 
         scan_display = False if (args.only_server or args.fixed_location or
                                  args.spawnpoint_scanning) else True
@@ -342,6 +349,14 @@ class Pogom(Flask):
             self.control_flags['on_demand'].clear()
         d = {}
 
+        if args.user_auth_service == "Discord":
+          if not valid_client_auth(request, self.user_auth_code_cache, args):
+            return redirect_client_to_auth(request.url_root, args)
+          if args.uas_discord_required_guild:
+            if not valid_discord_guild(request, self.user_auth_code_cache, args):
+              return redirect_to_discord_guild_invite(args)
+            if args.uas_discord_required_roles and not valid_discord_guild_role(request, self.user_auth_code_cache, args):
+              return redirect_to_discord_guild_invite(args)
         # Request time of this request.
         d['timestamp'] = datetime.utcnow()
 
